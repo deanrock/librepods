@@ -83,6 +83,8 @@ pub enum ControlCommandIdentifiers {
     StemConfig = 0x39,
     SleepDetectionConfig = 0x35,
     AllowAutoConnect = 0x36,
+    PpeToggleConfig = 0x37,
+    PpeCapLevelConfig = 0x38,
     EarDetectionConfig = 0x0A,
     AutomaticConnectionConfig = 0x20,
     OwnsConnection = 0x06,
@@ -123,6 +125,8 @@ impl ControlCommandIdentifiers {
             0x39 => Some(Self::StemConfig),
             0x35 => Some(Self::SleepDetectionConfig),
             0x36 => Some(Self::AllowAutoConnect),
+            0x37 => Some(Self::PpeToggleConfig),
+            0x38 => Some(Self::PpeCapLevelConfig),
             0x0A => Some(Self::EarDetectionConfig),
             0x20 => Some(Self::AutomaticConnectionConfig),
             0x06 => Some(Self::OwnsConnection),
@@ -166,6 +170,8 @@ impl std::fmt::Display for ControlCommandIdentifiers {
             ControlCommandIdentifiers::StemConfig => "Stem Config",
             ControlCommandIdentifiers::SleepDetectionConfig => "Sleep Detection Config",
             ControlCommandIdentifiers::AllowAutoConnect => "Allow Auto Connect",
+            ControlCommandIdentifiers::PpeToggleConfig => "PPE Toggle Config",
+            ControlCommandIdentifiers::PpeCapLevelConfig => "PPE Cap Level Config",
             ControlCommandIdentifiers::EarDetectionConfig => "Ear Detection Config",
             ControlCommandIdentifiers::AutomaticConnectionConfig => "Automatic Connection Config",
             ControlCommandIdentifiers::OwnsConnection => "Owns Connection",
@@ -205,6 +211,28 @@ pub enum StemPressType {
 pub enum StemPressBudType {
     Left = 0x01,
     Right = 0x02,
+}
+
+impl StemPressType {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x05 => Some(Self::SinglePress),
+            0x06 => Some(Self::DoublePress),
+            0x07 => Some(Self::TriplePress),
+            0x08 => Some(Self::LongPress),
+            _ => None,
+        }
+    }
+}
+
+impl StemPressBudType {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::Left),
+            0x02 => Some(Self::Right),
+            _ => None,
+        }
+    }
 }
 
 #[repr(u8)]
@@ -283,6 +311,7 @@ pub enum AACPEvent {
     AudioSource(AudioSource),
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
+    StemPress(StemPressType, StemPressBudType),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,7 +609,7 @@ impl AACPManager {
                         hex::encode(&value)
                     );
                 } else {
-                    error!(
+                    debug!(
                         "Unknown Control Command identifier: {:#04x}",
                         identifier_byte
                     );
@@ -795,7 +824,38 @@ impl AACPManager {
                     error!("Failed to save devices: {}", e);
                 }
             }
-            opcodes::STEM_PRESS => info!("Received Stem Press packet."),
+            opcodes::STEM_PRESS => {
+                if packet.len() >= 8 {
+                    if let (Some(press_type), Some(bud_type)) = (
+                        StemPressType::from_u8(packet[6]),
+                        StemPressBudType::from_u8(packet[7]),
+                    ) {
+                        info!("Stem Press: {:?} on {:?}", press_type, bud_type);
+                        let state = self.state.lock().await;
+                        if let Some(ref tx) = state.event_tx {
+                            let _ = tx.send(AACPEvent::StemPress(press_type, bud_type));
+                        }
+                        drop(state);
+                        // Re-enable stem press detection after receiving a press
+                        if let Err(e) = self
+                            .send_control_command(
+                                ControlCommandIdentifiers::StemConfig,
+                                &[0x01, 0, 0, 0],
+                            )
+                            .await
+                        {
+                            error!("Failed to re-enable stem press: {}", e);
+                        }
+                    } else {
+                        debug!(
+                            "Unknown stem press values: type={:#04x}, bud={:#04x}",
+                            packet[6], packet[7]
+                        );
+                    }
+                } else {
+                    error!("Stem Press packet too short: {}", hex::encode(packet));
+                }
+            }
             opcodes::AUDIO_SOURCE => {
                 if payload.len() < 9 {
                     error!("Audio Source packet too short: {}", hex::encode(payload));
